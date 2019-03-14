@@ -38,6 +38,9 @@ public class AerospikeStoreManager extends AbstractStoreManager implements KeyCo
 
     private final ThreadPoolExecutor aerospikeExecutor;
 
+    public static boolean fails = false;
+    private Random random = new Random();
+
     public AerospikeStoreManager(Configuration configuration) {
         super(configuration);
 
@@ -134,7 +137,10 @@ public class AerospikeStoreManager extends AbstractStoreManager implements KeyCo
 
         mutations.forEach((storeName, entry) -> {
             final AerospikeKeyColumnValueStore store = openDatabase(storeName);
-            entry.forEach((key, mutation) -> futures.add(runAsync(() -> {
+            entry.forEach((key, mutation) -> futures.add(runAsync(
+                    fails && random.nextBoolean()
+                            ? () -> {}
+                            : () -> {
                 store.mutate(key, mutation.getAdditions(), mutation.getDeletions());
                 mutatedByStore.compute(storeName, (s, keys) -> {
                     Set<StaticBuffer> keysResult = keys != null ? keys : new HashSet<>();
@@ -170,7 +176,7 @@ public class AerospikeStoreManager extends AbstractStoreManager implements KeyCo
             Set<StaticBuffer> mutatedForStore = mutatedByStore.get(storeLocks.storeName);
             List<StaticBuffer> keysToRelease = storeLocks.locksMap.keySet().stream()
                     //ignore mutated keys as they already have been released
-                    .filter(key -> !mutatedForStore.contains(key))
+                    .filter(key -> mutatedForStore == null || !mutatedForStore.contains(key))
                     .collect(Collectors.toList());
             store.getLockOperations().releaseLockOnKeys(keysToRelease);
         }
