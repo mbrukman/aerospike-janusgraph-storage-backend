@@ -4,7 +4,6 @@ import com.aerospike.client.*;
 import org.janusgraph.diskstorage.BackendException;
 import org.janusgraph.diskstorage.PermanentBackendException;
 import org.janusgraph.diskstorage.StaticBuffer;
-import org.janusgraph.diskstorage.configuration.Configuration;
 import org.janusgraph.diskstorage.locking.PermanentLockingException;
 import org.janusgraph.diskstorage.locking.TemporaryLockingException;
 
@@ -15,35 +14,30 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
-import static com.playtika.janusgraph.aerospike.AerospikeKeyColumnValueStore.getValue;
-import static com.playtika.janusgraph.aerospike.ConfigOptions.LOCK_TTL;
 import static com.playtika.janusgraph.aerospike.LockOperationsUdf.LockResult.*;
-import static com.playtika.janusgraph.aerospike.util.AsyncUtil.allOf;
+import static com.playtika.janusgraph.aerospike.util.AsyncUtil.completeAll;
 import static java.util.concurrent.CompletableFuture.runAsync;
 
 class LockOperationsUdf implements LockOperations{
 
     public static final String PACKAGE = "check_and_lock";
     public static final String CHECK_AND_LOCK_FUNCTION_NAME = "check_and_lock";
-    public static final Operation UNLOCK_OPERATION = Operation.put(new Bin("lock_time", (Long) null));
+    public static final Operation UNLOCK_OPERATION = Operation.put(new Bin("transaction", (Long) null));
 
     private final AerospikeClient client;
     private final AerospikeKeyColumnValueStore store;
-    private final long lockTtl;
     private final Executor aerospikeExecutor;
 
     LockOperationsUdf(AerospikeClient client,
-                      AerospikeKeyColumnValueStore store,
-                      Configuration configuration, Executor aerospikeExecutor) {
+                      AerospikeKeyColumnValueStore store, Executor aerospikeExecutor) {
         this.client = client;
         this.store = store;
 
-        lockTtl = configuration.get(LOCK_TTL);
         this.aerospikeExecutor = aerospikeExecutor;
     }
 
     @Override
-    public void acquireLocks(Map<StaticBuffer, List<AerospikeLock>> locks) throws BackendException {
+    public void acquireLocks(Value transactionId, Map<Value, Map<Value, Value>> locks) throws BackendException {
         Map<LockResult, List<Key>> lockResults = new ConcurrentHashMap<>();
 
         try {
@@ -51,15 +45,14 @@ class LockOperationsUdf implements LockOperations{
             List<CompletableFuture<?>> futures = new ArrayList<>();
             AtomicBoolean lockFailed = new AtomicBoolean(false);
 
-            for (Map.Entry<StaticBuffer, List<AerospikeLock>> locksForKey : locks.entrySet()) {
+            for (Map.Entry<Value, Map<Value, Value>> locksForKey : locks.entrySet()) {
                 futures.add(runAsync(() -> {
                     if(lockFailed.get()){
                         return;
                     }
 
                     Key key = store.getKey(locksForKey.getKey());
-                    LockResult lockResult = checkAndLock(client, key, lockTtl,
-                            buildExpectedValues(mergeLocks(locksForKey.getValue())));
+                    LockResult lockResult = checkAndLock(client, key, transactionId, locksForKey.getValue());
                     lockResults.compute(lockResult, (result, values) -> {
                         List<Key> resultValues = values != null ? values : new ArrayList<>();
                         resultValues.add(key);
@@ -71,7 +64,7 @@ class LockOperationsUdf implements LockOperations{
                 }, aerospikeExecutor));
             }
 
-            allOf(futures);
+            completeAll(futures);
 
             if(lockResults.keySet().contains(CHECK_FAILED)){
                 throw new PermanentLockingException("Some pre-lock checks failed:"+lockResults.keySet());
@@ -85,20 +78,9 @@ class LockOperationsUdf implements LockOperations{
         }
     }
 
-    private Map<Value, Value> buildExpectedValues(List<AerospikeLock> locks){
-        Map<Value, Value> expectedValues = new HashMap<>(locks.size());
-        for(AerospikeLock lock : locks){
-            if(lock.column != null){
-                expectedValues.put(getValue(lock.column),
-                        lock.expectedValue != null ? getValue(lock.expectedValue) : Value.NULL);
-            }
-        }
-        return expectedValues;
-    }
-
-    static LockResult checkAndLock(AerospikeClient client, Key key, long lockTtl, Map<Value, Value> expectedValues) {
+    static LockResult checkAndLock(AerospikeClient client, Key key, Value transactionId, Map<Value, Value> expectedValues) {
         return LockResult.values()[((Long) client.execute(null, key, PACKAGE, CHECK_AND_LOCK_FUNCTION_NAME,
-                Value.get(lockTtl), Value.get(expectedValues))).intValue()];
+                transactionId, Value.get(expectedValues))).intValue()];
     }
 
     enum LockResult {
@@ -108,19 +90,21 @@ class LockOperationsUdf implements LockOperations{
     }
 
     @Override
-    public void releaseLockOnKeys(Collection<StaticBuffer> keys) throws PermanentBackendException {
-        releaseLocks(keys.stream()
+    public CompletableFuture<Void> releaseLockOnKeys(Collection<Value> keys) throws PermanentBackendException {
+        return releaseLocks(keys.stream()
                 .map(store::getKey)
                 .collect(Collectors.toList())
         );
     }
 
-    private void releaseLocks(List<Key> keys) throws PermanentBackendException {
+    private CompletableFuture<Void> releaseLocks(List<Key> keys) throws PermanentBackendException {
         if(keys != null && !keys.isEmpty()) {
             List<CompletableFuture<?>> futures = new ArrayList<>();
             keys.forEach(key -> futures.add(runAsync(
                     () -> client.operate(null, key, UNLOCK_OPERATION))));
-            allOf(futures);
+            return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
+        } else {
+            return CompletableFuture.completedFuture(null);
         }
     }
 

@@ -15,11 +15,8 @@ local function equalBytes(a, b)
 end
 
 local function containsAllEntries(a, b)
-    if a == nil and map.size(b) == 0 then
-        return true
-    end
     for key, value in map.pairs(b) do
-        if(equalBytes(a[key], value)) then
+        if(a == nil and value == nil or equalBytes(a[key], value)) then
         else
             return false
         end
@@ -27,21 +24,24 @@ local function containsAllEntries(a, b)
     return true
 end
 
-function check_and_lock(rec, lock_ttl, expected_values_map)
-    local current_time = aerospike:get_current_time()
+function check_and_lock(rec, transaction, expected_values_map)
 
     if aerospike:exists(rec) then
-        local lock_time = rec['lock_time']
+        local current_transaction = rec['transaction']
+
+        if current_transaction then
+            if equalBytes(current_transaction, transaction) then
+                return 0
+            else
+                return 1
+            end
+        end
 
         if not containsAllEntries(rec['entries'], expected_values_map) then
             return 2
         end
 
-        if lock_time and lock_time + lock_ttl > current_time then
-            return 1
-        end
-
-        rec['lock_time'] = current_time;
+        rec['transaction'] = transaction;
         aerospike:update(rec)
         return 0
     else

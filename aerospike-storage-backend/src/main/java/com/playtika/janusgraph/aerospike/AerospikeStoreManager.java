@@ -4,21 +4,26 @@ import com.aerospike.client.*;
 import com.aerospike.client.policy.ClientPolicy;
 import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
+import com.playtika.janusgraph.aerospike.util.Promise;
 import org.janusgraph.diskstorage.*;
 import org.janusgraph.diskstorage.common.AbstractStoreManager;
 import org.janusgraph.diskstorage.configuration.Configuration;
 import org.janusgraph.diskstorage.keycolumnvalue.*;
 import org.janusgraph.graphdb.configuration.PreInitializeConfigOptions;
 
+import java.time.Clock;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static com.playtika.janusgraph.aerospike.AerospikeKeyColumnValueStore.getValue;
 import static com.playtika.janusgraph.aerospike.ConfigOptions.*;
-import static com.playtika.janusgraph.aerospike.util.AsyncUtil.allOf;
+import static com.playtika.janusgraph.aerospike.util.AsyncUtil.completeAll;
+import static com.playtika.janusgraph.aerospike.util.Promise.allOf;
+import static com.playtika.janusgraph.aerospike.util.Promise.promise;
 import static java.util.Collections.emptyMap;
-import static java.util.concurrent.CompletableFuture.runAsync;
+import static java.util.Collections.singleton;
 import static org.janusgraph.graphdb.configuration.GraphDatabaseConfiguration.*;
 
 
@@ -33,6 +38,8 @@ public class AerospikeStoreManager extends AbstractStoreManager implements KeyCo
     private final AerospikeClient client;
 
     private final Configuration configuration;
+
+    private final WriteAheadLogManager writeAheadLogManager;
 
     private final ThreadPoolExecutor scanExecutor;
 
@@ -52,11 +59,9 @@ public class AerospikeStoreManager extends AbstractStoreManager implements KeyCo
         ClientPolicy clientPolicy = new ClientPolicy();
 //        clientPolicy.user = storageConfig.get(AUTH_USERNAME);
 //        clientPolicy.password = storageConfig.get(AUTH_PASSWORD);
-        if(configuration.get(ALLOW_SCAN)){
-            clientPolicy.writePolicyDefault.sendKey = true;
-            clientPolicy.readPolicyDefault.sendKey = true;
-            clientPolicy.scanPolicyDefault.sendKey = true;
-        }
+        clientPolicy.writePolicyDefault.sendKey = true;
+        clientPolicy.readPolicyDefault.sendKey = true;
+        clientPolicy.scanPolicyDefault.sendKey = true;
 
         client = new AerospikeClient(clientPolicy, hosts);
 
@@ -71,6 +76,7 @@ public class AerospikeStoreManager extends AbstractStoreManager implements KeyCo
                 //caused by deferred locking approach used in this storage backend,
                 //actual locking happens just before transaction commit
                 .optimisticLocking(true)
+                .transactional(false)
                 .distributed(true)
                 .multiQuery(true)
                 .batchMutation(true)
@@ -79,11 +85,12 @@ public class AerospikeStoreManager extends AbstractStoreManager implements KeyCo
                 .keyOrdered(false)
                 .localKeyPartition(false)
                 .timestamps(false)
-                .transactional(false)
                 .supportsInterruption(false)
                 .build();
 
         registerUdfs(client);
+
+        writeAheadLogManager = new WriteAheadLogManager(client, configuration.get(WAL_NAMESPACE), Clock.systemUTC());
 
         scanExecutor = new ThreadPoolExecutor(0, configuration.get(SCAN_PARALLELISM),
                 1, TimeUnit.MINUTES, new LinkedBlockingQueue<>());
@@ -101,7 +108,7 @@ public class AerospikeStoreManager extends AbstractStoreManager implements KeyCo
     public AerospikeKeyColumnValueStore openDatabase(String name) {
         Preconditions.checkArgument(!Strings.isNullOrEmpty(name), "Database name may not be null or empty");
 
-        return new AerospikeKeyColumnValueStore(name, client, configuration, aerospikeExecutor, scanExecutor);
+        return new AerospikeKeyColumnValueStore(name, client, configuration, aerospikeExecutor, scanExecutor, writeAheadLogManager);
     }
 
     @Override
@@ -116,64 +123,123 @@ public class AerospikeStoreManager extends AbstractStoreManager implements KeyCo
 
     @Override
     public void mutateMany(Map<String, Map<StaticBuffer, KCVMutation>> mutations, StoreTransaction txh) throws BackendException {
-        List<StoreLocks> locksByStore = acquireLocks(((AerospikeTransaction) txh).getLocks());
+        Map<String, Map<Value, Map<Value, Value>>> locksByStore = groupLocksByStoreKeyColumn(
+                ((AerospikeTransaction) txh).getLocks());
 
+        Map<String, Map<Value, Map<Value, Value>>> mutationsByStore = groupMutationsByStoreKeyColumn(mutations);
+
+        Value transactionId = writeAheadLogManager.writeTransaction(locksByStore, mutationsByStore);
+
+        acquireLocks(transactionId, locksByStore);
         try {
-            Map<String, Set<StaticBuffer>> mutatedByStore = mutateMany(mutations);
+            Map<String, Set<Value>> mutatedByStore = mutateMany(mutationsByStore, locksByStore);
             releaseLocks(locksByStore, mutatedByStore);
         } catch (AerospikeException e) {
             releaseLocks(locksByStore, emptyMap());
             throw new PermanentBackendException(e);
+        } finally {
+            writeAheadLogManager.deleteTransaction(transactionId);
         }
     }
 
-    private Map<String, Set<StaticBuffer>> mutateMany(Map<String, Map<StaticBuffer, KCVMutation>> mutations) throws PermanentBackendException {
+    static Map<String, Map<Value, Map<Value, Value>>> groupLocksByStoreKeyColumn(List<AerospikeLock> locks){
+        return locks.stream()
+                .collect(Collectors.groupingBy(lock -> lock.storeName,
+                        Collectors.groupingBy(lock -> getValue(lock.key),
+                                Collectors.toMap(
+                                        lock -> getValue(lock.column),
+                                        lock -> lock.expectedValue != null ? getValue(lock.expectedValue) : Value.NULL,
+                                        (oldValue, newValue) -> oldValue))));
+    }
 
-        List<CompletableFuture<?>> futures = new ArrayList<>();
-        Map<String, Set<StaticBuffer>> mutatedByStore = new ConcurrentHashMap<>();
+    private static Map<String, Map<Value, Map<Value, Value>>> groupMutationsByStoreKeyColumn(
+            Map<String, Map<StaticBuffer, KCVMutation>> mutationsByStore){
+        Map<String, Map<Value, Map<Value, Value>>> mapByStore = new HashMap<>(mutationsByStore.size());
+        for(Map.Entry<String, Map<StaticBuffer, KCVMutation>> storeMutations : mutationsByStore.entrySet()) {
+            Map<Value, Map<Value, Value>> map = new HashMap<>(storeMutations.getValue().size());
+            for (Map.Entry<StaticBuffer, KCVMutation> mutationEntry : storeMutations.getValue().entrySet()) {
+                map.put(getValue(mutationEntry.getKey()), mutationToMap(mutationEntry.getValue()));
+            }
+            mapByStore.put(storeMutations.getKey(), map);
+        }
+        return mapByStore;
+    }
 
-        mutations.forEach((storeName, entry) -> {
+    static Map<Value, Value> mutationToMap(KCVMutation mutation){
+        Map<Value, Value> map = new HashMap<>(mutation.getAdditions().size() + mutation.getDeletions().size());
+        for(StaticBuffer deletion : mutation.getDeletions()){
+            map.put(getValue(deletion), Value.NULL);
+        }
+
+        for(Entry addition : mutation.getAdditions()){
+            map.put(getValue(addition.getColumn()), getValue(addition.getValue()));
+        }
+        return map;
+    }
+
+    private Map<String, Set<Value>> mutateMany(
+            Map<String, Map<Value, Map<Value, Value>>> mutationsByStore,
+            Map<String, Map<Value, Map<Value, Value>>> locksByStore) throws PermanentBackendException {
+
+        //first mutate not locked keys so need to split mutations
+        List<Promise<?>> notLockedMutations = new ArrayList<>();
+        List<Promise<?>> lockedMutations = new ArrayList<>();
+        Map<String, Set<Value>> mutatedByStore = new ConcurrentHashMap<>();
+
+        mutationsByStore.forEach((storeName, storeMutations) -> {
             final AerospikeKeyColumnValueStore store = openDatabase(storeName);
-            entry.forEach((key, mutation) -> futures.add(runAsync(() -> {
-                store.mutate(key, mutation.getAdditions(), mutation.getDeletions());
-                mutatedByStore.compute(storeName, (s, keys) -> {
-                    Set<StaticBuffer> keysResult = keys != null ? keys : new HashSet<>();
-                    keysResult.add(key);
-                    return keysResult;
-                });
-            }, aerospikeExecutor)));
+            Map<Value, Map<Value, Value>> storeLocks = locksByStore.get(storeName);
+            for(Map.Entry<Value, Map<Value, Value>> mutationEntry : storeMutations.entrySet()){
+                Value key = mutationEntry.getKey();
+                Map<Value, Value> mutation = mutationEntry.getValue();
+                Promise<?> mutationPromise = promise(() -> {
+                    store.mutate(key, mutation);
+                    mutatedByStore.compute(storeName, (s, keys) -> {
+                        Set<Value> keysResult = keys != null ? keys : new HashSet<>();
+                        keysResult.add(key);
+                        return keysResult;
+                    });
+                    return null;
+                }, aerospikeExecutor);
+                if(storeLocks != null && storeLocks.containsKey(key)){
+                    lockedMutations.add(mutationPromise);
+                } else {
+                    notLockedMutations.add(mutationPromise);
+                }
+            }
         });
 
-        allOf(futures);
+        allOf(notLockedMutations);
+        allOf(lockedMutations);
 
         return mutatedByStore;
     }
 
-    private List<StoreLocks> acquireLocks(List<AerospikeLock> locks) throws BackendException {
-        Map<String, List<AerospikeLock>> locksByStore = locks.stream()
-                .collect(Collectors.groupingBy(lock -> lock.storeName));
-        List<StoreLocks> locksAllByStore = new ArrayList<>(locksByStore.size());
-        for(Map.Entry<String, List<AerospikeLock>> entry : locksByStore.entrySet()){
+    private void acquireLocks(
+            Value transactionId,
+            Map<String, Map<Value, Map<Value, Value>>> locks) throws BackendException {
+        for(Map.Entry<String, Map<Value, Map<Value, Value>>> entry : locks.entrySet()){
             String storeName = entry.getKey();
-            List<AerospikeLock> locksForStore = entry.getValue();
-            StoreLocks storeLocks = new StoreLocks(storeName, locksForStore);
             final AerospikeKeyColumnValueStore store = openDatabase(storeName);
-            store.getLockOperations().acquireLocks(storeLocks.locksMap);
-            locksAllByStore.add(storeLocks);
+            store.getLockOperations().acquireLocks(transactionId, entry.getValue());
         }
-        return locksAllByStore;
     }
 
-    private void releaseLocks(List<StoreLocks> locksByStore, Map<String, Set<StaticBuffer>> mutatedByStore) throws PermanentBackendException {
-        for(StoreLocks storeLocks : locksByStore){
-            final AerospikeKeyColumnValueStore store = openDatabase(storeLocks.storeName);
-            Set<StaticBuffer> mutatedForStore = mutatedByStore.get(storeLocks.storeName);
-            List<StaticBuffer> keysToRelease = storeLocks.locksMap.keySet().stream()
+    private void releaseLocks(Map<String, Map<Value, Map<Value, Value>>> locksByStore,
+                              Map<String, Set<Value>> mutatedByStore) throws PermanentBackendException {
+        List<CompletableFuture<?>> storeFutures = new ArrayList<>(locksByStore.size());
+        for(Map.Entry<String, Map<Value, Map<Value, Value>>> storeLocks : locksByStore.entrySet()){
+            String storeName = storeLocks.getKey();
+            final AerospikeKeyColumnValueStore store = openDatabase(storeName);
+            Set<Value> mutatedForStore = mutatedByStore.get(storeName);
+            List<Value> keysToRelease = storeLocks.getValue().keySet().stream()
                     //ignore mutated keys as they already have been released
                     .filter(key -> !mutatedForStore.contains(key))
                     .collect(Collectors.toList());
-            store.getLockOperations().releaseLockOnKeys(keysToRelease);
+            storeFutures.add(store.getLockOperations().releaseLockOnKeys(keysToRelease));
         }
+
+        completeAll(storeFutures);
     }
 
     @Override
